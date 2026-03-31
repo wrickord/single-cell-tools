@@ -32,7 +32,6 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from scipy import sparse as sp
 from scipy import stats
-from umap import UMAP
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, classification_report
 from sklearn.neural_network import MLPClassifier
@@ -43,6 +42,11 @@ import background_jobs as bgjobs
 import benchmark as bench
 from background_jobs import validate_server_read_path
 from gradio_config import launch_gradio_demo, repo_root, runtime_info_markdown
+from scfm_model_paths import (
+    model_weights_choices_and_value,
+    model_weights_gr_update,
+    normalize_ui_weights_path,
+)
 from scripts.dataset_sources import (
     download_dataset,
     managed_data_root,
@@ -182,6 +186,9 @@ def _dense_status_from_bundle(sess_bundle: Optional[Dict[str, Any]]) -> str:
     if not session_dir:
         return "Load a dataset first."
     sdp = Path(session_dir).expanduser().resolve()
+    sk = str(sdp)
+    if pre.dense_session_get_adata(sk) is not None:
+        return "Dense matrix is **active** in RAM for this session (full `X` / embeddings)."
     dense_path = sdp / pre.DENSE_MATERIALIZED_H5AD
     if dense_path.is_file():
         return (
@@ -193,11 +200,11 @@ def _dense_status_from_bundle(sess_bundle: Optional[Dict[str, Any]]) -> str:
         elapsed = int(max(0.0, time.time() - float(st.get("started", 0.0))))
         return (
             f"Dense load running — **{elapsed}s** (background thread, full read into RAM; no extra `.h5ad`). "
-            "Click **Load Data** when finished to attach the dense object to this session."
+            "The UI refreshes automatically when finished."
         )
     if st.get("state") == "done":
         return (
-            "Dense load finished in RAM — click **Load Data** to use the full matrix for this session."
+            "Dense load finished in RAM — the **10s** timer will attach it and refresh dataset status automatically."
         )
     if st.get("state") == "error":
         _, payload = pre.dense_load_pop_terminal(str(sdp))
@@ -205,9 +212,18 @@ def _dense_status_from_bundle(sess_bundle: Optional[Dict[str, Any]]) -> str:
         return f"Dense load failed:\n{err}"
     return (
         "Current dataset is backed-only.\n"
-        "Click **Load Dense** for a full in-RAM read in the background (no disk copy). "
-        "Then click **Load Data** to apply."
+        "Click **Load Dense** for a full in-RAM read in the background (no disk copy); "
+        "status updates every **10s** and the session switches to dense when ready."
     )
+
+
+def _with_data_status_static(sess_bundle: Optional[Dict[str, Any]], fragment: str) -> str:
+    static = ""
+    if isinstance(sess_bundle, dict):
+        static = str(sess_bundle.get("_data_status_static") or "").strip()
+    if static:
+        return f"{static}\n\n{fragment}"
+    return fragment
 
 
 def start_dense_load_ui(server_h5ad_path, sess_bundle):
@@ -225,10 +241,12 @@ def start_dense_load_ui(server_h5ad_path, sess_bundle):
                 prefer_dense=False,
             )
         if not source_path:
-            return "Set a server `.h5ad` path first.", sess_bundle
+            return _with_data_status_static(sess_bundle, "Set a server `.h5ad` path first."), sess_bundle
         src = validate_server_read_path(source_path)
         if src.suffix.lower() != ".h5ad":
-            return "Load Dense currently supports only `.h5ad` inputs.", sess_bundle
+            return _with_data_status_static(
+                sess_bundle, "Load Dense currently supports only `.h5ad` inputs."
+            ), sess_bundle
         sdp = Path(session_dir).expanduser().resolve()
         sdp.mkdir(parents=True, exist_ok=True)
         dense_path = sdp / pre.DENSE_MATERIALIZED_H5AD
@@ -237,41 +255,69 @@ def start_dense_load_ui(server_h5ad_path, sess_bundle):
                 sess_bundle,
                 source_h5ad_path=str(src),
             )
-            return (
+            frag = (
                 f"Legacy materialized file exists: `{dense_path}` — `Load Data` already prefers it.\n"
-                "Start **Load Dense** again to drop that file and reload fully in RAM (no new copy).",
-                new_bundle,
+                "Start **Load Dense** again to drop that file and reload fully in RAM (no new copy)."
             )
+            return _with_data_status_static(new_bundle, frag), new_bundle
         poll = pre.dense_load_poll(str(sdp))
         if poll.get("state") == "running":
-            return (
-                "Dense load **already running** — wait for it to finish, then click **Load Data**.",
+            return _with_data_status_static(
                 sess_bundle,
-            )
+                "Dense load **already running** — wait for automatic refresh when it finishes.",
+            ), sess_bundle
         ok, err = pre.dense_load_start(str(sdp), str(src))
         if not ok:
-            return (f"Could not start dense load: {err}", sess_bundle)
+            return _with_data_status_static(sess_bundle, f"Could not start dense load: {err}"), sess_bundle
         new_bundle = _bundle_with_materialized_paths(
             sess_bundle,
             source_h5ad_path=str(src),
         )
         new_bundle.pop("dense_h5ad_path", None)
-        return (
+        frag = (
             "Started **Load Dense** — background thread reads the full `.h5ad` into **RAM** "
             "(no `adata_dense_materialized.h5ad`).\n"
-            "When status says finished, click **Load Data** to attach the dense object.",
-            new_bundle,
+            "Dataset status will update automatically when loading completes."
         )
+        return _with_data_status_static(new_bundle, frag), new_bundle
     except Exception as e:
-        return f"Dense load error: {e}", sess_bundle
+        return _with_data_status_static(sess_bundle, f"Dense load error: {e}"), sess_bundle
 
 
-def refresh_dense_load_ui(sess_bundle):
-    try:
-        new_bundle = _bundle_with_materialized_paths(sess_bundle)
-        return _dense_status_from_bundle(new_bundle), new_bundle
-    except Exception as e:
-        return f"Dense status refresh error: {e}", sess_bundle
+def _load_data_timer_output_skips() -> tuple[Any, ...]:
+    return tuple([gr.skip()] * 18)
+
+
+def poll_dense_session_timer(server_h5ad_path, transpose, session_state):
+    """Refresh dense line in dataset status; when load completes, re-run Load Data logic."""
+    sk = _load_data_timer_output_skips()
+    if not isinstance(session_state, dict):
+        return sk
+    sdp_raw = str(session_state.get("dir") or "").strip()
+    if not sdp_raw:
+        return sk
+    sdp = str(Path(sdp_raw).expanduser().resolve())
+    kind, payload = pre.dense_load_pop_terminal(sdp)
+    if kind == "error":
+        err = str(payload or "unknown").strip()
+        static = str(session_state.get("_data_status_static") or "").strip()
+        msg = (
+            (static + "\n\n**Dense load failed:**\n" + err)
+            if static
+            else f"**Dense load failed:**\n{err}"
+        )
+        return (gr.update(value=msg), session_state) + sk[2:]
+    st = pre.dense_load_poll(sdp)
+    if st.get("state") == "done":
+        ram = pre.dense_ram_take_if_ready(sdp)
+        if ram is not None:
+            return load_data_options(server_h5ad_path, transpose, session_state)
+    static = str(session_state.get("_data_status_static") or "").strip()
+    if not static:
+        return sk
+    dense_part = _dense_status_from_bundle(session_state)
+    full = f"{static}\n\n{dense_part}"
+    return (gr.update(value=full), session_state) + sk[2:]
 
 
 def _norm_src_key(raw: Any) -> Optional[Tuple[str, str]]:
@@ -856,13 +902,19 @@ def load_data_options(server_h5ad_path, transpose, sess_bundle):
             group_default = "cell_type" if "cell_type" in obs_cols else "(none)"
             obsm_default = "(default)"
             de_value_choices = _unique_obs_values(adata, group_default)
+            viewer_obsm_pick = None
+            if obsm_cols:
+                viewer_obsm_pick = (
+                    "X_umap" if "X_umap" in obsm_cols else obsm_cols[0]
+                )
             mode_label = "backed" if pre.adata_is_backed(adata) else "dense"
-            status = (
+            static = (
                 f"Loaded dataset metadata in {mode_label} mode: n_obs={adata.n_obs:,}, n_vars={adata.n_vars:,}\n"
                 f"obs columns={len(obs_cols)}, obsm keys={len(obsm_cols)}\n"
-                f"default output dir: `{session_dir}`\n"
-                f"{_dense_status_from_bundle(bundle)}"
+                f"default output dir: `{session_dir}`"
             )
+            bundle["_data_status_static"] = static
+            status = static + "\n\n" + _dense_status_from_bundle(bundle)
             return (
                 status,
                 bundle,
@@ -882,7 +934,8 @@ def load_data_options(server_h5ad_path, transpose, sess_bundle):
                     choices=embed_choices,
                     value=pre._pick_matrix_source_value("X", embed_choices),
                 ),
-                _dense_status_from_bundle(bundle),
+                gr.update(choices=obsm_cols, value=viewer_obsm_pick),
+                gr.update(choices=["(none)"] + obs_cols, value=color_default),
                 gr.update(choices=de_value_choices, value=[]),
                 gr.update(choices=de_value_choices, value=[]),
                 gr.update(
@@ -907,7 +960,8 @@ def load_data_options(server_h5ad_path, transpose, sess_bundle):
             gr.update(choices=["(none)"], value="(none)"),
             gr.update(choices=["X"], value="X"),
             gr.update(choices=["X"], value="X"),
-            "Load a dataset first.",
+            gr.update(choices=[], value=None),
+            gr.update(choices=["(none)"], value="(none)"),
             gr.update(choices=[], value=[]),
             gr.update(choices=[], value=[]),
             gr.update(choices=["X"], value="X"),
@@ -1082,7 +1136,10 @@ def refresh_benchmark_sources_ui(
                 f"- session-derived sources: {n_external}",
             ]
             if n_external:
-                lines.append("- render a view to expose `obsm:X_pca` / `obsm:X_umap`; finish an embedding run to expose `obsm:X_scgpt`, `obsm:X_scvi`, etc.")
+                lines.append(
+                    "- use **Compute PCA + UMAP** or an embedding run to add `obsm:X_pca` / `obsm:X_umap` (or `X_scgpt`, `X_scvi`, …); "
+                    "**Embedding viewer** reads any existing `obsm` key."
+                )
             return (
                 "\n".join(lines),
                 gr.update(choices=choices, value=valid),
@@ -1950,10 +2007,20 @@ def _render_view_outputs(
     point_size,
     alpha,
     dragmode,
+    *,
+    obsm_key: str = "X_umap",
+    axes_2d: Tuple[int, int] = (0, 1),
 ):
-    U = np.asarray(adata.obsm.get("X_umap"))
-    if U.ndim != 2 or U.shape[1] < 2:
-        raise ValueError("Current view does not contain obsm['X_umap'].")
+    key = str(obsm_key or "X_umap").strip() or "X_umap"
+    U = np.asarray(adata.obsm.get(key))
+    if U.ndim != 2:
+        raise ValueError(f"obsm[{key!r}] must be 2D.")
+    ax0, ax1 = int(axes_2d[0]), int(axes_2d[1])
+    if U.shape[1] <= max(ax0, ax1):
+        raise ValueError(
+            f"obsm[{key!r}] has shape {U.shape}; need columns for axes {ax0}, {ax1}."
+        )
+    U = U[:, [ax0, ax1]]
     max_tbl = sess_res.embed_table_max_rows()
     n_cells = U.shape[0]
     max_plot = sess_res.umap_plot_max_cells()
@@ -2002,6 +2069,7 @@ def refresh_view_status(
     view_bundle: Optional[Dict[str, Any]],
     session_bundle: Optional[Dict[str, Any]],
     color_by,
+    viewer_color_by,
     gene_symbol,
     facet_by,
     hover_cols,
@@ -2031,10 +2099,53 @@ def refresh_view_status(
             extra_paths=[("Current view", path)] if path else None,
         )
     )
+    dp = str(view_bundle.get("data_path") or path or "").strip()
+    if view_bundle.get("view_mode") == "embedding_viewer" and dp:
+        try:
+            adx = ad.read_h5ad(dp, backed="r")
+            try:
+                df_show, fig, st, artifacts, extra = _render_embedding_viewer_plots(
+                    adx,
+                    session_dir or str(view_bundle.get("dir") or ""),
+                    str(view_bundle.get("obsm_key") or "X_umap"),
+                    int(view_bundle.get("view_n_dims") or 2),
+                    int(view_bundle.get("max_cells") or 0),
+                    viewer_color_by,
+                    gene_symbol,
+                    facet_by,
+                    hover_cols,
+                    point_size,
+                    alpha,
+                    dragmode,
+                    dp,
+                )
+            finally:
+                _close_adata_handle(adx)
+            new_bundle = {**view_bundle, **extra}
+            new_bundle["path"] = dp
+            new_bundle["data_path"] = dp
+            new_bundle["status"] = st
+            if session_dir:
+                new_bundle["dir"] = session_dir
+            art_updates = _artifact_updates(
+                artifacts + [("View data .h5ad", dp)] if artifacts else [("View data .h5ad", dp)]
+            )
+            return df_show, fig, st, *art_updates, new_bundle
+        except Exception as e:
+            return (
+                gr.skip(),
+                gr.skip(),
+                f"{status_txt}\n\nEmbedding viewer refresh error: {e}",
+                *updates,
+                view_bundle,
+            )
     if not path:
         return gr.skip(), gr.skip(), status_txt, *updates, view_bundle
     try:
         adx = ad.read_h5ad(path)
+        sel = tuple(view_bundle.get("select_axes", (0, 1)))
+        if len(sel) != 2:
+            sel = (0, 1)
         df_show, fig = _render_view_outputs(
             adx,
             session_dir,
@@ -2045,6 +2156,8 @@ def refresh_view_status(
             point_size,
             alpha,
             dragmode,
+            obsm_key=str(view_bundle.get("obsm_key") or "X_umap"),
+            axes_2d=(int(sel[0]), int(sel[1])),
         )
         new_bundle = dict(view_bundle)
         new_bundle["path"] = path
@@ -2060,7 +2173,7 @@ def _artifact_path_choice(path: str):
     return gr.update(value=str(path or ""))
 
 
-def start_view_job(
+def compute_embeddings_ui(
     server_h5ad_path,
     transpose,
     matrix_spec,
@@ -2068,25 +2181,16 @@ def start_view_job(
     n_pcs,
     n_neighbors,
     min_dist,
-    color_by,
-    gene_symbol,
-    facet_by,
-    hover_cols,
-    point_size,
-    alpha,
-    dragmode,
     sess_bundle,
 ):
+    """PCA/SVD + UMAP from a matrix spec; writes source-specific ``obsm`` keys + ``X_pca``/``X_umap``."""
     try:
         spath = str(server_h5ad_path or "").strip()
         if not spath:
             return (
                 sess_bundle,
-                gr.update(value=None),
-                gr.update(value=None),
                 "Set a server path first.",
                 *_artifact_updates([]),
-                None,
             )
         preferred = _preferred_h5ad_path_for_session(
             server_h5ad_path,
@@ -2107,10 +2211,10 @@ def start_view_job(
             bundle = _bundle_with_materialized_paths(bundle, source_h5ad_path=preferred)
             spec = str(matrix_spec or "X").strip() or "X"
             safe = spec.replace(":", "_").replace("/", "_")
-            result_path = Path(session_dir) / f"view_{safe}.h5ad"
-            view_adata = pre.build_matrix_view_adata(
+            result_path = Path(session_dir) / f"embed_{safe}.h5ad"
+            view_adata = pre.compute_matrix_embeddings_adata(
                 adata,
-                matrix_spec=spec,
+                spec,
                 max_cells=int(max_cells or 0),
                 n_pcs=int(n_pcs or 50),
                 n_neighbors=int(n_neighbors or 15),
@@ -2119,51 +2223,107 @@ def start_view_job(
         finally:
             _close_adata_handle(adata)
         view_adata.write_h5ad(result_path, compression="gzip")
-        df_show, fig = _render_view_outputs(
-            view_adata,
-            session_dir,
-            color_by,
-            gene_symbol,
-            facet_by,
-            hover_cols,
-            point_size,
-            alpha,
-            dragmode,
-        )
+        pca_k = str(view_adata.uns.get("scfms_embed_pca_key") or "X_pca")
+        umap_k = str(view_adata.uns.get("scfms_embed_umap_key") or "X_umap")
         txt = (
-            f"Rendered view.\n"
-            f"Source: {spec}\n"
-            f"Cells in view: {view_adata.n_obs:,}\n"
-            f"Features in view: {view_adata.n_vars:,}\n"
-            f"Saved view file: {result_path}\n"
-            f"Session: {session_dir}"
+            f"Computed PCA + UMAP from `{spec}`.\n"
+            f"Saved `{result_path}`.\n"
+            f"obsm: `{pca_k}`, `{umap_k}` (also `X_pca` / `X_umap` for tools).\n"
+            f"Use **Embedding viewer** below with obsm `{umap_k}` or `X_umap`.\n"
+            f"Heavy `X` runs: **Load dense** or lower **Compute max cells**.\n"
+            f"Session: `{session_dir}`"
         )
-        view_bundle = {
-            "mode": "foreground",
-            "matrix_spec": spec,
-            "path": str(result_path),
-            "status": txt,
+        arts = [
+            ("Embedded .h5ad", str(result_path)),
+            ("Session folder", str(Path(session_dir).expanduser().resolve())),
+        ]
+        return (bundle, txt, *_artifact_updates(arts))
+    except Exception as e:
+        return (sess_bundle, f"Compute embeddings error: {e}", *_artifact_updates([]))
+
+
+def render_embedding_viewer_ui(
+    server_h5ad_path,
+    transpose,
+    sess_bundle,
+    obsm_key,
+    max_cells,
+    view_n_dims,
+    viewer_color_by,
+    gene_symbol,
+    facet_by,
+    hover_cols,
+    point_size,
+    alpha,
+    dragmode,
+):
+    """Plot existing ``obsm`` coordinates only (no UMAP refit); saves all panels under session ``plots/``."""
+    try:
+        spath = str(server_h5ad_path or "").strip()
+        if not spath:
+            return (
+                gr.update(value=None),
+                gr.update(value=None),
+                "Set a server path first.",
+                *_artifact_updates([]),
+                None,
+            )
+        preferred = _preferred_h5ad_path_for_session(
+            server_h5ad_path,
+            sess_bundle,
+            prefer_dense=True,
+        )
+        data_path = str(validate_server_read_path(preferred))
+        adata = _load_adata_from_inputs(
+            None,
+            server_h5ad_path,
+            transpose,
+            backed=True,
+            preferred_h5ad_path=preferred,
+            sess_bundle=sess_bundle,
+        )
+        try:
+            session_dir = str((sess_bundle or {}).get("dir") or "").strip()
+            if not session_dir:
+                src_key = _session_src_key(None, server_h5ad_path)
+                _sd, bundle = _ensure_session(sess_bundle, src_key, adata)
+                session_dir = str(_sd)
+            else:
+                bundle = sess_bundle if isinstance(sess_bundle, dict) else {}
+            df_show, fig, st, artifacts, extra = _render_embedding_viewer_plots(
+                adata,
+                session_dir,
+                obsm_key,
+                view_n_dims,
+                max_cells,
+                viewer_color_by,
+                gene_symbol,
+                facet_by,
+                hover_cols,
+                point_size,
+                alpha,
+                dragmode,
+                data_path,
+            )
+        finally:
+            _close_adata_handle(adata)
+        view_bundle: Dict[str, Any] = {
+            "view_mode": "embedding_viewer",
+            "path": data_path,
+            "data_path": data_path,
+            "status": st,
             "dir": session_dir,
         }
-        return (
-            bundle,
-            df_show,
-            fig,
-            txt,
-            *_artifact_updates(
-                [
-                    ("Current view", str(result_path)),
-                    ("Session folder", str(Path(session_dir).expanduser().resolve())),
-                ]
-            ),
-            view_bundle,
+        view_bundle.update(extra)
+        art_updates = _artifact_updates(
+            artifacts + [("View data .h5ad", data_path)] if artifacts else [("View data .h5ad", data_path)]
         )
+        return (df_show, fig, st, *art_updates, view_bundle)
     except Exception as e:
         return (
-            sess_bundle,
             gr.update(value=None),
             gr.update(value=None),
-            f"View render error: {e}",
+            f"Embedding viewer error: {e}",
             *_artifact_updates([]),
             None,
         )
@@ -2172,6 +2332,8 @@ def start_view_job(
 def _get_color_vector(
     adata: ad.AnnData, gene_symbol: str | None, color_by: str | None
 ) -> tuple[np.ndarray | None, str]:
+    if isinstance(color_by, (list, tuple)) and color_by:
+        color_by = color_by[0]
     # Gene expression takes precedence if present
     if gene_symbol:
         gs = str(gene_symbol).strip()
@@ -2188,15 +2350,16 @@ def _get_color_vector(
                     expr = np.asarray(X[:, idx]).ravel()
                 return expr, f"Expression: {gs}"
     # Otherwise use metadata column
-    if color_by and color_by in adata.obs.columns:
-        s = adata.obs[color_by]
-        # Return as numpy; caller decides discrete/continuous
-        vals = s.values
-        try:
-            vals = s.astype(float).values  # type: ignore[assignment]
-        except Exception:
-            vals = s.astype(str).values
-        return np.asarray(vals), f"Color by: {color_by}"
+    cb = str(color_by or "").strip()
+    if cb and cb != "(none)" and cb in adata.obs.columns:
+        s = adata.obs[cb]
+        if pd.api.types.is_numeric_dtype(s.dtype) and not isinstance(
+            s.dtype, pd.CategoricalDtype
+        ):
+            vals = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
+            return vals, f"Color by: {cb}"
+        vals = s.astype(str).to_numpy()
+        return vals, f"Color by: {cb}"
     return None, ""
 
 
@@ -2290,6 +2453,344 @@ def _build_plotly_umap(
     return fig
 
 
+def _embedding_figure_plan(n_dims_user: Any, n_avail: int) -> List[Tuple[str, Tuple[int, ...]]]:
+    """2D consecutive pairs within the first *d* dimensions, plus up to two 3D views."""
+    if n_avail < 2:
+        return []
+    try:
+        nd_u = int(n_dims_user) if n_dims_user is not None else 2
+    except (TypeError, ValueError):
+        nd_u = 2
+    nd_u = max(2, nd_u)
+    d = min(nd_u, n_avail)
+    out: List[Tuple[str, Tuple[int, ...]]] = []
+    for i in range(d - 1):
+        a, b = i, i + 1
+        out.append((f"2D dims {a + 1}–{b + 1}", (a, b)))
+    if d >= 3:
+        out.append(("3D dims 1–3", (0, 1, 2)))
+    if d >= 4:
+        out.append(("3D dims 2–4", (1, 2, 3)))
+    return out
+
+
+def _build_plotly_embedding_scatter2d(
+    E: np.ndarray,
+    plot_idx: np.ndarray,
+    adata: ad.AnnData,
+    i: int,
+    j: int,
+    color_vec: np.ndarray | None,
+    color_title: str,
+    hover_cols: list[str],
+    facet_by: str | None,
+    point_size: int,
+    alpha: float,
+    dragmode: str,
+    title: str,
+) -> go.Figure:
+    xi, xj = int(i), int(j)
+    c1, c2 = f"Dim{xi + 1}", f"Dim{xj + 1}"
+    df = pd.DataFrame(
+        {c1: E[plot_idx, xi], c2: E[plot_idx, xj]},
+        index=adata.obs_names[plot_idx],
+    )
+    if color_vec is not None:
+        arr = np.asarray(color_vec)
+        if arr.dtype == object or arr.dtype.kind in ("U", "S", "O"):
+            df["__color__"] = [str(x) for x in arr.tolist()]
+        else:
+            df["__color__"] = np.asarray(arr, dtype=float)
+    else:
+        df["__color__"] = ""
+    if facet_by and facet_by in adata.obs.columns:
+        df["__facet__"] = adata.obs.loc[df.index, facet_by].astype(str).values
+    else:
+        df["__facet__"] = "all"
+    for hc in hover_cols[:8]:
+        if hc in adata.obs.columns:
+            df[f"hover:{hc}"] = adata.obs.loc[df.index, hc].astype(str).values
+    hover_data = {c: True for c in df.columns if c.startswith("hover:")}
+    if facet_by and df["__facet__"].nunique() > 1:
+        fig = px.scatter(
+            df,
+            x=c1,
+            y=c2,
+            color="__color__" if color_vec is not None else None,
+            facet_col="__facet__",
+            facet_col_wrap=4,
+            opacity=max(0.0, min(1.0, alpha)),
+            hover_data=hover_data,
+            title=title,
+        )
+    else:
+        fig = px.scatter(
+            df,
+            x=c1,
+            y=c2,
+            color="__color__" if color_vec is not None else None,
+            opacity=max(0.0, min(1.0, alpha)),
+            hover_data=hover_data,
+            title=title,
+        )
+    fig.update_traces(marker=dict(size=int(point_size), line=dict(width=0)))
+    fig.update_layout(
+        dragmode=dragmode if dragmode in ("zoom", "select", "lasso") else "zoom"
+    )
+    if color_vec is not None and color_title:
+        fig.update_layout(
+            legend_title_text=color_title, coloraxis_colorbar_title=color_title
+        )
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    return fig
+
+
+def _build_plotly_embedding_scatter3d(
+    E: np.ndarray,
+    plot_idx: np.ndarray,
+    adata: ad.AnnData,
+    axes: Tuple[int, int, int],
+    color_vec: np.ndarray | None,
+    color_title: str,
+    hover_cols: list[str],
+    facet_by: str | None,
+    point_size: int,
+    alpha: float,
+    dragmode: str,
+    title: str,
+) -> go.Figure:
+    a, b, c = int(axes[0]), int(axes[1]), int(axes[2])
+    c1, c2, c3 = f"Dim{a + 1}", f"Dim{b + 1}", f"Dim{c + 1}"
+    df = pd.DataFrame(
+        {
+            c1: E[plot_idx, a],
+            c2: E[plot_idx, b],
+            c3: E[plot_idx, c],
+        },
+        index=adata.obs_names[plot_idx],
+    )
+    if color_vec is not None:
+        arr = np.asarray(color_vec)
+        if arr.dtype == object or arr.dtype.kind in ("U", "S", "O"):
+            df["__color__"] = [str(x) for x in arr.tolist()]
+        else:
+            df["__color__"] = np.asarray(arr, dtype=float)
+    else:
+        df["__color__"] = ""
+    if facet_by and facet_by in adata.obs.columns:
+        df["__facet__"] = adata.obs.loc[df.index, facet_by].astype(str).values
+    else:
+        df["__facet__"] = "all"
+    for hc in hover_cols[:8]:
+        if hc in adata.obs.columns:
+            df[f"hover:{hc}"] = adata.obs.loc[df.index, hc].astype(str).values
+    hover_data = {k: True for k in df.columns if k.startswith("hover:")}
+    if facet_by and df["__facet__"].nunique() > 1:
+        fig = px.scatter_3d(
+            df,
+            x=c1,
+            y=c2,
+            z=c3,
+            color="__color__" if color_vec is not None else None,
+            facet_col="__facet__",
+            opacity=max(0.05, min(1.0, alpha)),
+            hover_data=hover_data,
+            title=title,
+        )
+    else:
+        fig = px.scatter_3d(
+            df,
+            x=c1,
+            y=c2,
+            z=c3,
+            color="__color__" if color_vec is not None else None,
+            opacity=max(0.05, min(1.0, alpha)),
+            hover_data=hover_data,
+            title=title,
+        )
+    fig.update_traces(marker=dict(size=max(1, int(point_size) // 2), line=dict(width=0)))
+    fig.update_layout(scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)))
+    dm = dragmode if dragmode in ("zoom", "select", "lasso") else "zoom"
+    if dm == "lasso":
+        dm = "orbit"
+    fig.update_layout(scene_dragmode=dm)
+    if color_vec is not None and color_title:
+        fig.update_layout(legend_title_text=color_title)
+    return fig
+
+
+def _safe_obsm_stem(key: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(key))[:80]
+
+
+def _plotly_read_html_figure(path: str) -> Any:
+    p = Path(str(path or "").strip())
+    if not p.is_file():
+        return gr.skip()
+    try:
+        import plotly.io as pio
+
+        return pio.read_html(str(p), auto_open=False)
+    except Exception:
+        return gr.skip()
+
+
+def _view_artifact_pick(path: str) -> tuple[Any, Any]:
+    return gr.update(value=str(path or "")), _plotly_read_html_figure(path)
+
+
+def _render_embedding_viewer_plots(
+    adata: ad.AnnData,
+    session_dir: str,
+    obsm_key: str,
+    view_n_dims: int,
+    max_cells: int,
+    viewer_color_by,
+    gene_symbol,
+    facet_by,
+    hover_cols,
+    point_size,
+    alpha,
+    dragmode,
+    data_path: str,
+) -> tuple[pd.DataFrame, Any, str, list[tuple[str, str]], dict[str, Any]]:
+    key = str(obsm_key or "").strip()
+    if not key or key not in adata.obsm:
+        raise ValueError(
+            f"obsm key {key!r} not found; available: {list(adata.obsm.keys())}"
+        )
+    E = np.asarray(adata.obsm[key], dtype=np.float64)
+    if E.ndim != 2 or E.shape[1] < 2:
+        raise ValueError(f"obsm[{key!r}] must be 2D with ≥2 columns, got {E.shape}")
+    n_cols_orig = int(E.shape[1])
+    try:
+        nd_cap = int(view_n_dims) if view_n_dims is not None else 2
+    except (TypeError, ValueError):
+        nd_cap = 2
+    nd_cap = max(2, nd_cap)
+    n_use = min(nd_cap, n_cols_orig)
+    E = np.ascontiguousarray(E[:, :n_use])
+    n_cells = E.shape[0]
+    max_plot = sess_res.umap_plot_max_cells()
+    mc = int(max_cells or 0)
+    if mc > 0 and n_cells > mc:
+        rng2 = np.random.default_rng(1)
+        candidates = np.sort(rng2.choice(n_cells, size=mc, replace=False))
+    else:
+        candidates = np.arange(n_cells)
+    if len(candidates) > max_plot:
+        rng = np.random.default_rng(0)
+        rel = np.sort(rng.choice(len(candidates), size=max_plot, replace=False))
+        plot_idx = candidates[rel]
+    else:
+        plot_idx = candidates
+
+    color_vec_full, color_title = _get_color_vector(
+        adata, gene_symbol, viewer_color_by
+    )
+    if color_vec_full is not None and len(color_vec_full) != adata.n_obs:
+        color_vec_full, color_title = None, ""
+    cvec = (
+        np.asarray(color_vec_full)[plot_idx]
+        if color_vec_full is not None
+        else None
+    )
+    if isinstance(hover_cols, (list, tuple)):
+        hv_list = [str(x).strip() for x in hover_cols if str(x).strip()]
+    else:
+        hv_list = [x.strip() for x in str(hover_cols or "").split(",") if x.strip()]
+    facet_s = None if (not facet_by or facet_by == "(none)") else str(facet_by)
+
+    plans = _embedding_figure_plan(nd_cap, E.shape[1])
+    if not plans:
+        raise ValueError("Not enough embedding dimensions to plot.")
+
+    stem_base = _safe_obsm_stem(key)
+    artifacts: list[tuple[str, str]] = []
+    figs: list[tuple[str, Any]] = []
+    for label, axes in plans:
+        if len(axes) == 2:
+            fig = _build_plotly_embedding_scatter2d(
+                E,
+                plot_idx,
+                adata,
+                axes[0],
+                axes[1],
+                cvec,
+                color_title,
+                hv_list,
+                facet_s,
+                int(point_size) if point_size is not None else 4,
+                float(alpha) if alpha is not None else 0.8,
+                str(dragmode) if dragmode else "zoom",
+                f"{key} — {label}",
+            )
+            stem = f"view_{stem_base}_2d_{axes[0]+1}_{axes[1]+1}"
+        elif len(axes) == 3:
+            fig = _build_plotly_embedding_scatter3d(
+                E,
+                plot_idx,
+                adata,
+                (axes[0], axes[1], axes[2]),
+                cvec,
+                color_title,
+                hv_list,
+                facet_s,
+                int(point_size) if point_size is not None else 4,
+                float(alpha) if alpha is not None else 0.8,
+                str(dragmode) if dragmode else "zoom",
+                f"{key} — {label}",
+            )
+            stem = f"view_{stem_base}_3d_{axes[0]+1}_{axes[1]+1}_{axes[2]+1}"
+        else:
+            continue
+        outp = _save_plotly_figure_if_session(fig, session_dir, stem)
+        if outp is not None:
+            artifacts.append((f"{label} ({key})", str(outp)))
+        figs.append((label, fig))
+
+    primary_fig = figs[0][1]
+    max_tbl = sess_res.embed_table_max_rows()
+    X_show = adata.X[:max_tbl]
+    if sp.issparse(X_show):
+        df_arr = np.asarray(X_show.toarray())
+    else:
+        df_arr = np.asarray(X_show)
+    df_show = pd.DataFrame(df_arr, index=adata.obs_names[: len(df_arr)])
+    try:
+        sdp = Path(session_dir).expanduser().resolve()
+        pd.DataFrame({"cell": adata.obs_names[plot_idx]}).to_csv(
+            sdp / "umap_plot_map.csv", index=False
+        )
+    except Exception:
+        pass
+
+    sel_axes = (0, 1)
+    for label, axes in plans:
+        if len(axes) == 2:
+            sel_axes = (int(axes[0]), int(axes[1]))
+            break
+
+    status = (
+        f"Embedding viewer: `{key}` — using first **{n_use}** / {n_cols_orig} obsm columns "
+        f"(# dims setting={nd_cap}), points plotted={len(plot_idx):,}\n"
+        f"Saved {len(artifacts)} figure(s) under `{Path(session_dir).expanduser().resolve() / 'plots'}`\n"
+        f"Data file (DE / selection): `{data_path}`"
+    )
+    bundle_extra = {
+        "view_mode": "embedding_viewer",
+        "data_path": data_path,
+        "obsm_key": key,
+        "view_n_dims": int(nd_cap),
+        "view_n_dims_used": int(n_use),
+        "max_cells": int(max_cells or 0),
+        "select_axes": sel_axes,
+        "plot_artifacts": artifacts,
+    }
+    return df_show, primary_fig, status, artifacts, bundle_extra
+
+
 def _compute_de(
     adata: ad.AnnData,
     group_col: str,
@@ -2368,7 +2869,7 @@ def run_embed(
     model,
     server_h5ad_path,
     transpose,
-    scgpt_ckpt,
+    model_weights_path,
     n_latent,
     embed_matrix_spec,
     exec_mode,
@@ -2476,11 +2977,12 @@ def run_embed(
                 gpu_floor = 1
             gres = _compose_gres(gpu_floor, sbatch_gpu_type)
             repo_root_val = (sbatch_repo_root or "").strip()
+            wpath = normalize_ui_weights_path(str(model), model_weights_path)
             sc_kwargs = dict(
                 model=str(model),
                 matrix_spec=embed_spec,
                 obsm_key=None if obsm_key_override in (None, "", "(default)") else str(obsm_key_override),
-                scgpt_ckpt=(scgpt_ckpt or "").strip() or None,
+                scgpt_ckpt=wpath,
                 n_latent_scvi=int(n_latent) if n_latent is not None else 64,
             )
             jid = bgjobs.start_scfm_slurm_job_from_h5ad(
@@ -2533,11 +3035,12 @@ def run_embed(
         )
         session_dir, bundle = _ensure_session(sess_bundle, src_key, adata)
         bundle = _bundle_with_materialized_paths(bundle, source_h5ad_path=preferred)
+        wpath = normalize_ui_weights_path(str(model), model_weights_path)
         sc_kwargs = dict(
             model=str(model),
             matrix_spec=embed_spec,
             obsm_key=None if obsm_key_override in (None, "", "(default)") else str(obsm_key_override),
-            scgpt_ckpt=(scgpt_ckpt or "").strip() or None,
+            scgpt_ckpt=wpath,
             n_latent_scvi=int(n_latent) if n_latent is not None else 64,
             compat_report_dir=session_dir,
         )
@@ -2590,8 +3093,9 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
     with gr.Accordion("Where is this running? (server vs laptop)", open=False):
         gr.Markdown(runtime_info_markdown())
     gr.Markdown(
-        "Compute embeddings with **Geneformer**, **scGPT**, or **scVI** (same pipeline as the preprocess app: "
-        "compatibility checks + PDF). Prefer **Server path** on the cluster so large `.h5ad` files are not uploaded through the browser. "
+        "Compute embeddings with **Geneformer**, **Transcriptformer**, **scGPT**, or **scVI** (same pipeline as the preprocess app: "
+        "compatibility checks + PDF). Use **Model weights / checkpoint** to pick `./models/…` paths or env defaults per model. "
+        "Prefer **Server path** on the cluster so large `.h5ad` files are not uploaded through the browser. "
         "For large cell counts, **UMAP** is fit on a **random subset** for responsiveness; full embeddings are still computed for all cells. "
         "New dataset sessions (plots, logs, `session_meta.json`) are created under "
         "**`<repo>/.assets/<dataset bucket>/<timestamp>_<label>/`** — the bucket is the managed-dataset folder: "
@@ -2652,18 +3156,26 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
     with gr.Row():
         load_data_btn = gr.Button("Load Data", variant="secondary", scale=1)
         load_dense_btn = gr.Button("Load Dense", variant="secondary", scale=1)
-        refresh_dense_btn = gr.Button("Refresh Dense Status", scale=1)
-    data_status = gr.Textbox(label="Loaded dataset status", interactive=False)
-    dense_status = gr.Textbox(label="Dense load status", interactive=False)
+    data_status = gr.Textbox(label="Loaded dataset status", interactive=False, lines=12)
+    dense_session_timer = gr.Timer(value=10.0)
     with gr.Row():
         _m = pre.list_scfm_model_names()
+        _init_m = _m[0] if _m else "geneformer"
+        _w_ch, _w_val = model_weights_choices_and_value(_init_m)
         model = gr.Radio(
             _m,
-            value=_m[0] if _m else "geneformer",
+            value=_init_m,
             label="Model",
         )
         transpose = gr.Checkbox(label="Transpose CSV/TSV", value=False)
-        scgpt_ckpt = gr.Textbox(label="scGPT checkpoint dir (if using scGPT)")
+        model_weights = gr.Dropdown(
+            choices=_w_ch,
+            value=_w_val,
+            allow_custom_value=True,
+            label="Model weights / checkpoint",
+            info="Subfolders under ./models and env defaults; type any path or Hugging Face id.",
+            scale=3,
+        )
     n_latent = gr.Number(
         label="scVI n_latent (ignored for other models)",
         value=64,
@@ -2674,6 +3186,11 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
         choices=["X"],
         value="X",
         label="Embedding input matrix",
+    )
+    embed_matrix_guide = gr.Markdown(
+        value=pre.scfm_embed_matrix_guide(
+            (pre.list_scfm_model_names() or ["geneformer"])[0], "X"
+        )
     )
     exec_mode = gr.Dropdown(
         choices=["current_node", "sbatch"],
@@ -2742,28 +3259,84 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
             scale=3,
         )
     run_artifact_path = gr.Textbox(label="Selected output path", interactive=False)
-    gr.Markdown("### Independent View / Plot Source")
+    gr.Markdown(
+        "### Embeddings: compute vs viewer\n"
+        "**Compute** runs PCA/SVD + UMAP on a **matrix spec** (`X`, `raw.X`, `layer:…`, `obsm:…`) and saves "
+        "`<source>_pca` / `<source>_umap` keys (e.g. `X_raw_pca`, `X_umap`) plus `X_pca` / `X_umap` for tools. "
+        "Heavy full-matrix runs work best after **Load dense** or with **Compute max cells** > 0.\n\n"
+        "**Viewer** only reads an existing `obsm` (e.g. `X_umap_scpoli`). **# dims** caps how many **leading** columns "
+        "of that matrix are used (e.g. 4 → dims 1–4 only). Set **# dims** ≥ 3 to add extra 2D pairs and 3D panels. "
+        "Figures save as HTML under the session `plots/` folder."
+    )
+    with gr.Accordion("1. Compute PCA + UMAP (writes obsm)", open=True):
+        with gr.Row():
+            view_matrix_spec = gr.Dropdown(
+                choices=["X"],
+                value="X",
+                label="Compute source matrix",
+            )
+            view_max_cells = gr.Number(
+                label="Compute max cells (0 = all)",
+                value=0,
+                precision=0,
+                minimum=0,
+            )
+            view_n_pcs = gr.Number(
+                label="PCA / SVD components",
+                value=50,
+                precision=0,
+                minimum=0,
+            )
+        with gr.Row():
+            compute_n_neighbors = gr.Slider(
+                label="UMAP n_neighbors (compute)",
+                value=15,
+                minimum=5,
+                maximum=50,
+                step=1,
+            )
+            compute_min_dist = gr.Slider(
+                label="UMAP min_dist (compute)",
+                value=0.1,
+                minimum=0.0,
+                maximum=0.99,
+                step=0.01,
+            )
+        compute_embeddings_btn = gr.Button(
+            "Compute PCA + UMAP to obsm",
+            variant="secondary",
+        )
+    with gr.Accordion("2. Embedding viewer (read obsm only)", open=True):
+        with gr.Row():
+            viewer_obsm_key = gr.Dropdown(
+                choices=[],
+                value=None,
+                label="Viewer obsm key",
+                allow_custom_value=True,
+            )
+            viewer_max_cells = gr.Number(
+                label="Viewer max cells (0 = all; display only)",
+                value=0,
+                precision=0,
+                minimum=0,
+            )
+            viewer_n_dims = gr.Number(
+                label="# dims to use (subset leading obsm columns; ≥3 adds extra 2D/3D panels)",
+                value=2,
+                precision=0,
+                minimum=2,
+            )
+            viewer_color_by = gr.Dropdown(
+                choices=["(none)"],
+                value="(none)",
+                label="Viewer color by (obs column)",
+            )
+        render_embedding_views_btn = gr.Button(
+            "Render embedding views",
+            variant="secondary",
+        )
     with gr.Row():
-        view_matrix_spec = gr.Dropdown(
-            choices=["X"],
-            value="X",
-            label="View source matrix",
-        )
-        view_max_cells = gr.Number(
-            label="View max cells (0 = all)",
-            value=0,
-            precision=0,
-            minimum=0,
-        )
-        view_n_pcs = gr.Number(
-            label="View PCA/SVD comps",
-            value=50,
-            precision=0,
-            minimum=0,
-        )
-    with gr.Row():
-        render_view_btn = gr.Button("Render PCA/UMAP View", variant="secondary")
-        refresh_view_btn = gr.Button("Refresh View", variant="secondary")
+        refresh_view_btn = gr.Button("Refresh view / colors", variant="secondary")
     view_status = gr.Textbox(label="View status", interactive=False, lines=8)
     with gr.Row():
         view_artifacts = gr.Dropdown(
@@ -2870,7 +3443,7 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
         outputs=[download_status, dataset_pick, dataset_dir_info, server_path, download_state],
     )
     out = gr.Dataframe(label="Current View Matrix (truncated for display)", wrap=True)
-    plot = gr.Plot(label="UMAP (interactive)")
+    plot = gr.Plot(label="Embedding (interactive)")
     compat_pdf = gr.File(label="Compatibility report (PDF)", interactive=False)
     de_table = gr.Dataframe(label="Differential Expression (top genes)", wrap=True)
     de_csv = gr.File(label="Download DE CSV", interactive=False)
@@ -3189,7 +3762,8 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
             dot_facet_by,
             view_matrix_spec,
             embed_matrix_spec,
-            dense_status,
+            viewer_obsm_key,
+            viewer_color_by,
             de_fore_vals,
             de_back_vals,
             dist_matrix_spec,
@@ -3293,12 +3867,36 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
     load_dense_btn.click(
         start_dense_load_ui,
         inputs=[server_path, session_state],
-        outputs=[dense_status, session_state],
+        outputs=[data_status, session_state],
     )
-    refresh_dense_btn.click(
-        refresh_dense_load_ui,
-        inputs=[session_state],
-        outputs=[dense_status, session_state],
+    dense_session_timer.tick(
+        poll_dense_session_timer,
+        inputs=[server_path, transpose, session_state],
+        outputs=[
+            data_status,
+            session_state,
+            session_path_disp,
+            color_by,
+            facet_by,
+            hover_cols,
+            obsm_key_override,
+            inspector_group_by,
+            de_group_col,
+            dot_facet_by,
+            view_matrix_spec,
+            embed_matrix_spec,
+            viewer_obsm_key,
+            viewer_color_by,
+            de_fore_vals,
+            de_back_vals,
+            dist_matrix_spec,
+            dist_by_obs,
+        ],
+    )
+    model.change(
+        model_weights_gr_update,
+        inputs=[model],
+        outputs=[model_weights],
     )
     model.change(
         recommend_settings_for_ui,
@@ -3312,6 +3910,13 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
             sbatch_time,
             run_recommendation,
         ],
+    )
+    model.change(
+        lambda m, spec: gr.update(
+            value=pre.scfm_embed_matrix_guide(str(m or ""), str(spec or ""))
+        ),
+        inputs=[model, embed_matrix_spec],
+        outputs=[embed_matrix_guide],
     )
     de_group_col.change(
         update_de_value_choices_ui,
@@ -3357,6 +3962,13 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
             run_recommendation,
         ],
     )
+    embed_matrix_spec.change(
+        lambda m, spec: gr.update(
+            value=pre.scfm_embed_matrix_guide(str(m or ""), str(spec or ""))
+        ),
+        inputs=[model, embed_matrix_spec],
+        outputs=[embed_matrix_guide],
+    )
     exec_mode.change(
         _toggle_exec_mode,
         inputs=[exec_mode],
@@ -3369,7 +3981,7 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
             model,
             server_path,
             transpose,
-            scgpt_ckpt,
+            model_weights,
             n_latent,
             embed_matrix_spec,
             exec_mode,
@@ -3415,7 +4027,7 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
             model,
             server_path,
             transpose,
-            scgpt_ckpt,
+            model_weights,
             n_latent,
             embed_matrix_spec,
             exec_mode,
@@ -3465,27 +4077,43 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
         inputs=[run_artifacts],
         outputs=[run_artifact_path],
     )
-    render_view_btn.click(
-        start_view_job,
+    compute_embeddings_btn.click(
+        compute_embeddings_ui,
         inputs=[
             server_path,
             transpose,
             view_matrix_spec,
             view_max_cells,
             view_n_pcs,
-            n_neighbors,
-            min_dist,
-            color_by,
+            compute_n_neighbors,
+            compute_min_dist,
+            session_state,
+        ],
+        outputs=[
+            session_state,
+            view_status,
+            view_artifacts,
+            view_artifact_path,
+        ],
+    )
+    render_embedding_views_btn.click(
+        render_embedding_viewer_ui,
+        inputs=[
+            server_path,
+            transpose,
+            session_state,
+            viewer_obsm_key,
+            viewer_max_cells,
+            viewer_n_dims,
+            viewer_color_by,
             gene_symbol,
             facet_by,
             hover_cols,
             point_size,
             alpha,
             dragmode,
-            session_state,
         ],
         outputs=[
-            session_state,
             out,
             plot,
             view_status,
@@ -3505,6 +4133,7 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
             view_state,
             session_state,
             color_by,
+            viewer_color_by,
             gene_symbol,
             facet_by,
             hover_cols,
@@ -3522,9 +4151,9 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
         ],
     )
     view_artifacts.change(
-        _artifact_path_choice,
+        _view_artifact_pick,
         inputs=[view_artifacts],
-        outputs=[view_artifact_path],
+        outputs=[view_artifact_path, plot],
     )
     refresh_benchmark_sources_btn.click(
         refresh_benchmark_sources_ui,
@@ -3695,20 +4324,28 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
             except Exception:
                 pass
         elif mode == "umap_rect":
-            U = adx.obsm.get("X_umap")
-            if U is not None:
+            vb = sess_bundle_dict if isinstance(sess_bundle_dict, dict) else {}
+            ok = str(vb.get("obsm_key") or "X_umap")
+            axs = vb.get("select_axes", (0, 1))
+            if not isinstance(axs, (list, tuple)) or len(axs) < 2:
+                axs = (0, 1)
+            a0, a1 = int(axs[0]), int(axs[1])
+            Uraw = adx.obsm.get(ok)
+            if Uraw is not None:
                 try:
-                    xmin = float(xmin)
-                    xmax = float(xmax)
-                    ymin = float(ymin)
-                    ymax = float(ymax)
-                    m = (
-                        (U[:, 0] >= min(xmin, xmax))
-                        & (U[:, 0] <= max(xmin, xmax))
-                        & (U[:, 1] >= min(ymin, ymax))
-                        & (U[:, 1] <= max(ymin, ymax))
-                    )
-                    sel_mask = m
+                    U = np.asarray(Uraw)
+                    if U.ndim == 2 and U.shape[1] > max(a0, a1):
+                        xmin = float(xmin)
+                        xmax = float(xmax)
+                        ymin = float(ymin)
+                        ymax = float(ymax)
+                        m = (
+                            (U[:, a0] >= min(xmin, xmax))
+                            & (U[:, a0] <= max(xmin, xmax))
+                            & (U[:, a1] >= min(ymin, ymax))
+                            & (U[:, a1] <= max(ymin, ymax))
+                        )
+                        sel_mask = m
                 except Exception:
                     pass
         # Persist selection

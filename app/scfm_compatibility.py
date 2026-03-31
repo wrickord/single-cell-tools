@@ -266,7 +266,7 @@ def validate_for_embedding(
             )
         )
 
-    if model in ("geneformer", "scgpt"):
+    if model in ("geneformer", "transcriptformer", "scgpt"):
         if stats["heuristic_looks_log_normalized"]:
             findings.append(
                 Finding(
@@ -280,7 +280,10 @@ def validate_for_embedding(
         stats["gene_name_style"] = gstyle
         stats["gene_name_style_confidence"] = conf
         if model == "geneformer":
-            frac_ok, err = geneformer_vocab_check(list(map(str, ad_emb.var_names)))
+            gf_ck = (scgpt_ckpt or "").strip() or None
+            frac_ok, err = geneformer_vocab_check(
+                list(map(str, ad_emb.var_names)), model_name=gf_ck
+            )
             stats["geneformer_vocab_hit_rate"] = frac_ok
             stats["geneformer_vocab_note"] = err
             if frac_ok is not None:

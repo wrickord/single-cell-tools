@@ -12,7 +12,12 @@ def _repo_root() -> Path:
 
 
 def _run_module(module: str, extra_args: list[str]) -> int:
-    cmd = [sys.executable, "-m", module, *extra_args]
+    # REMAINDER keeps a literal "--" if the user wrote `main.py <cmd> -- --flags …`;
+    # child CLIs do not expect that token.
+    rest = list(extra_args or [])
+    while rest and rest[0] == "--":
+        rest.pop(0)
+    cmd = [sys.executable, "-m", module, *rest]
     return subprocess.run(cmd, cwd=_repo_root(), check=False).returncode
 
 

@@ -3,6 +3,7 @@ import hashlib
 import json
 import multiprocessing as mp
 import os
+import re
 import sys
 import threading
 import time
@@ -28,6 +29,11 @@ from slurm_defaults import default_slurm_partition, effective_slurm_partition
 import anndata as ad
 import background_jobs as bgjobs
 from gradio_config import launch_gradio_demo, runtime_info_markdown
+from scfm_model_paths import (
+    model_weights_choices_and_value,
+    model_weights_gr_update,
+    normalize_ui_weights_path,
+)
 import session_results as sess_res
 import gradio as gr
 import matplotlib.pyplot as plt
@@ -546,6 +552,44 @@ def _list_embedding_matrix_options(adata: ad.AnnData) -> List[str]:
     return opts
 
 
+def scfm_embed_matrix_guide(model: str, matrix_spec: str = "") -> str:
+    """Short Markdown for the embeddings UI: which ``matrix_spec`` to use per model."""
+    m = (model or "geneformer").strip().lower()
+    spec = (matrix_spec or "").strip()
+    hdr = (
+        "**Matrix dropdown (`X`, `raw.X`, `layer:…`):** "
+        "Use **`raw.X`** when counts live in ``adata.raw`` and ``adata.X`` is normalized/scaled. "
+        "Use **`X`** when the matrix you want is already in ``adata.X``. "
+        "The embedder takes that slice **as-is** (no hidden log-normalization).\n\n"
+    )
+    per = {
+        "geneformer": (
+            "**Geneformer:** Non-negative **count-like** values so per-cell **ranking** of expressed genes matches pretraining. "
+            "Prefer **`raw.X`** for UMIs. **Do not** log-normalize before this step. "
+            "``var_names`` should match the tokenizer (often **Ensembl**)."
+        ),
+        "transcriptformer": (
+            "**Transcriptformer:** Same idea as Geneformer — **counts / raw-like** matrix, rank tokenization; match HF gene IDs."
+        ),
+        "scgpt": (
+            "**scGPT:** This repo rank-tokenizes nonzeros like Geneformer — **`raw.X`** counts are fine. "
+            "Gene symbols/IDs must match the checkpoint **vocab.json**."
+        ),
+        "scvi": (
+            "**scVI:** Fits a VAE on **your** matrix; **integer UMI counts** are ideal → **`raw.X`** when it holds counts. "
+            "Running on log-normalized ``X`` is allowed mechanically but is not the count likelihood setup."
+        ),
+    }
+    body = per.get(m, "**Model:** see repository docs for input expectations.")
+    foot = (
+        "\n\n**`raw.X` auto-handling:** If you select **`raw.X`**, the code copies that matrix into a temporary "
+        "``AnnData`` for the model — no extra preprocessing is applied beyond what each embedder already does."
+    )
+    if spec:
+        foot += f"\n\n*Current selection:* `{spec}`."
+    return hdr + body + foot
+
+
 def _format_hms_from_hours(hours: float) -> str:
     total = max(1, int(np.ceil(float(hours) * 3600.0)))
     hh, rem = divmod(total, 3600)
@@ -913,6 +957,96 @@ def _reduce_matrix_for_quick_umap(
     )
 
 
+def _import_umap():
+    try:
+        from umap import UMAP
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "Install `umap-learn` for UMAP (e.g. `pip install umap-learn`)."
+        ) from e
+    return UMAP
+
+
+def embedding_storage_keys_from_matrix_spec(spec: str) -> Tuple[str, str]:
+    """Return ``(pca_key, umap_key)`` for embeddings derived from *matrix_spec*."""
+    s = (spec or "X").strip() or "X"
+    if s == "X":
+        return "X_pca", "X_umap"
+    if s == "raw.X":
+        return "X_raw_pca", "X_raw_umap"
+    if s.startswith("layer:"):
+        k = s.split(":", 1)[1].strip()
+        k = re.sub(r"[^a-zA-Z0-9_]+", "_", k)[:64]
+        return f"X_layer_{k}_pca", f"X_layer_{k}_umap"
+    if s.startswith("obsm:"):
+        k = s.split(":", 1)[1].strip()
+        k = re.sub(r"[^a-zA-Z0-9_]+", "_", k)[:64]
+        return f"X_{k}_pca", f"X_{k}_umap"
+    tok = re.sub(r"[^a-zA-Z0-9_]+", "_", s)[:64]
+    return f"X_{tok}_pca", f"X_{tok}_umap"
+
+
+def _prepare_view_work_copy(adata: ad.AnnData, max_cells: int) -> ad.AnnData:
+    mc = int(max_cells) if max_cells is not None else 0
+    if mc > 0 and adata.n_obs > mc:
+        rng = np.random.default_rng(42)
+        ix = np.sort(rng.choice(adata.n_obs, size=mc, replace=False))
+        sub = adata[ix]
+        if adata_is_backed(adata):
+            return sub.to_memory()
+        return sub.copy()
+    return adata.copy()
+
+
+def _compute_z_umap_view(
+    work: ad.AnnData,
+    spec: str,
+    n_pcs: int,
+    n_neighbors: int,
+    min_dist: float,
+) -> Tuple[np.ndarray, np.ndarray, ad.AnnData, int]:
+    """Return ``Z, U, view_adata, n_neighbors_used``."""
+    npc = int(n_pcs) if n_pcs is not None else 0
+    spec = str(spec or "X").strip() or "X"
+    if spec.startswith("obsm:"):
+        key = spec.split(":", 1)[1]
+        if key not in work.obsm:
+            raise ValueError(f"obsm key '{key}' not found; have {list(work.obsm.keys())}")
+        E = np.asarray(work.obsm[key], dtype=np.float32)
+        if E.ndim != 2:
+            raise ValueError(f"obsm[{key!r}] must be 2D, got shape {E.shape}")
+        n_feat = int(E.shape[1])
+        var_df = pd.DataFrame(index=[f"{key}_{i}" for i in range(n_feat)])
+        view = ad.AnnData(E.copy(), obs=work.obs.copy(), var=var_df)
+        view.obsm[key] = E.copy()
+        if E.shape[1] < 2:
+            Z = np.column_stack(
+                [E, np.zeros((E.shape[0], 2 - E.shape[1]), dtype=np.float32)]
+            )
+        else:
+            Z = _reduce_obsm_for_quick_umap(E, npc)
+    else:
+        M = _matrix_from_spec(work, spec)
+        var_df = _matrix_var_frame_for_spec(work, spec)
+        X_copy = M.copy() if hasattr(M, "copy") else np.asarray(M)
+        view = ad.AnnData(X=X_copy, obs=work.obs.copy(), var=var_df.copy())
+        Z = _reduce_matrix_for_quick_umap(M, npc)
+
+    nn = max(2, int(n_neighbors) if n_neighbors is not None else 15)
+    nn = min(nn, max(2, Z.shape[0] - 1))
+    UMAP = _import_umap()
+    U = np.asarray(
+        UMAP(
+            n_components=2,
+            n_neighbors=nn,
+            min_dist=float(min_dist),
+            random_state=0,
+        ).fit_transform(Z),
+        dtype=np.float32,
+    )
+    return Z, U, view, nn
+
+
 def _reduce_obsm_for_quick_umap(E: np.ndarray, n_pcs_requested: int) -> np.ndarray:
     """Optional PCA on high-dimensional obsm before UMAP."""
     max_auto = 50
@@ -946,56 +1080,44 @@ def build_matrix_view_adata(
 ) -> ad.AnnData:
     """Build an analysis/view AnnData from ``X``, ``raw.X``, ``layer:*`` or ``obsm:*`` with ``X_pca`` and ``X_umap``."""
     spec = str(matrix_spec or "X").strip() or "X"
-    work = adata
-    mc = int(max_cells) if max_cells is not None else 0
-    if mc > 0 and adata.n_obs > mc:
-        rng = np.random.default_rng(42)
-        ix = np.sort(rng.choice(adata.n_obs, size=mc, replace=False))
-        sub = adata[ix]
-        if adata_is_backed(adata):
-            work = sub.to_memory()
-        else:
-            work = sub.copy()
-    else:
-        work = adata.copy()
-
+    work = _prepare_view_work_copy(adata, max_cells)
+    Z, U, view, nn = _compute_z_umap_view(work, spec, n_pcs, n_neighbors, min_dist)
     npc = int(n_pcs) if n_pcs is not None else 0
-    if spec.startswith("obsm:"):
-        key = spec.split(":", 1)[1]
-        if key not in work.obsm:
-            raise ValueError(f"obsm key '{key}' not found; have {list(work.obsm.keys())}")
-        E = np.asarray(work.obsm[key], dtype=np.float32)
-        if E.ndim != 2:
-            raise ValueError(f"obsm[{key!r}] must be 2D, got shape {E.shape}")
-        n_feat = int(E.shape[1])
-        var_df = pd.DataFrame(index=[f"{key}_{i}" for i in range(n_feat)])
-        view = ad.AnnData(E.copy(), obs=work.obs.copy(), var=var_df)
-        view.obsm[key] = E.copy()
-        if E.shape[1] < 2:
-            Z = np.column_stack([E, np.zeros((E.shape[0], 2 - E.shape[1]), dtype=np.float32)])
-        else:
-            Z = _reduce_obsm_for_quick_umap(E, npc)
-    else:
-        M = _matrix_from_spec(work, spec)
-        var_df = _matrix_var_frame_for_spec(work, spec)
-        X_copy = M.copy() if hasattr(M, "copy") else np.asarray(M)
-        view = ad.AnnData(X=X_copy, obs=work.obs.copy(), var=var_df.copy())
-        Z = _reduce_matrix_for_quick_umap(M, npc)
     view.obsm["X_pca"] = np.asarray(Z, dtype=np.float32)
-
-    nn = max(2, int(n_neighbors) if n_neighbors is not None else 15)
-    nn = min(nn, max(2, Z.shape[0] - 1))
-    U = np.asarray(
-        UMAP(
-            n_components=2,
-            n_neighbors=nn,
-            min_dist=float(min_dist),
-            random_state=0,
-        ).fit_transform(Z),
-        dtype=np.float32,
-    )
     view.obsm["X_umap"] = U
     view.uns["scfms_view_matrix_spec"] = spec
+    view.uns["scfms_view_n_pcs"] = int(npc)
+    view.uns["scfms_view_n_neighbors"] = int(nn)
+    view.uns["scfms_view_min_dist"] = float(min_dist)
+    return view
+
+
+def compute_matrix_embeddings_adata(
+    adata: ad.AnnData,
+    matrix_spec: str,
+    *,
+    max_cells: int = 0,
+    n_pcs: int = 50,
+    n_neighbors: int = 15,
+    min_dist: float = 0.1,
+) -> ad.AnnData:
+    """
+    Same pipeline as :func:`build_matrix_view_adata`, but also writes source-specific keys
+    (e.g. ``X_raw_pca`` / ``X_raw_umap``) alongside ``X_pca`` / ``X_umap`` for tools compatibility.
+    """
+    spec = str(matrix_spec or "X").strip() or "X"
+    work = _prepare_view_work_copy(adata, max_cells)
+    Z, U, view, nn = _compute_z_umap_view(work, spec, n_pcs, n_neighbors, min_dist)
+    pca_k, umap_k = embedding_storage_keys_from_matrix_spec(spec)
+    Zf = np.asarray(Z, dtype=np.float32)
+    view.obsm["X_pca"] = Zf
+    view.obsm["X_umap"] = U.copy()
+    view.obsm[pca_k] = Zf.copy()
+    view.obsm[umap_k] = U.copy()
+    npc = int(n_pcs) if n_pcs is not None else 0
+    view.uns["scfms_view_matrix_spec"] = spec
+    view.uns["scfms_embed_pca_key"] = pca_k
+    view.uns["scfms_embed_umap_key"] = umap_k
     view.uns["scfms_view_n_pcs"] = int(npc)
     view.uns["scfms_view_n_neighbors"] = int(nn)
     view.uns["scfms_view_min_dist"] = float(min_dist)
@@ -2167,7 +2289,7 @@ def _normalize_obsm_key(model: str, user_key: Optional[str]) -> str:
 
 
 # Registry: name -> (embed_fn, stable order for UI). Extend via ``register_scfm_embedder``.
-# Each ``embed_fn(ad_emb, scgpt_ckpt, n_latent_scvi) -> np.ndarray`` receives the same
+# Each ``embed_fn(ad_emb, weights_path, n_latent_scvi) -> np.ndarray`` receives the same
 # ``AnnData`` slice as the legacy path. Add matching entries in ``scfm_compatibility`` for PDF checks.
 ScfmEmbedFn = Callable[[ad.AnnData, Optional[str], int], np.ndarray]
 _SCFM_EMBED_ORDER: List[str] = []
@@ -2190,19 +2312,21 @@ def list_scfm_model_names() -> List[str]:
 
 
 def _default_embed_geneformer(
-    ad_emb: ad.AnnData, _scgpt_ckpt: Optional[str], _n_latent: int
+    ad_emb: ad.AnnData, weights_path: Optional[str], _n_latent: int
 ) -> np.ndarray:
     from scripts.generate_embeddings import embed_geneformer
 
-    return embed_geneformer(ad_emb)
+    p = (weights_path or "").strip() or None
+    return embed_geneformer(ad_emb, pretrained_name_or_path=p)
 
 
 def _default_embed_transcriptformer(
-    ad_emb: ad.AnnData, _scgpt_ckpt: Optional[str], _n_latent: int
+    ad_emb: ad.AnnData, weights_path: Optional[str], _n_latent: int
 ) -> np.ndarray:
     from scripts.generate_embeddings import embed_transcriptformer
 
-    return embed_transcriptformer(ad_emb)
+    p = (weights_path or "").strip() or None
+    return embed_transcriptformer(ad_emb, pretrained_name_or_path=p)
 
 
 def _default_embed_scgpt(
@@ -2234,6 +2358,21 @@ def _init_default_scfm_embedders() -> None:
 _init_default_scfm_embedders()
 
 
+def _resolve_scfm_weights_path(model: str, ui_path: Optional[str]) -> Optional[str]:
+    """Prefer explicit UI path; else model-specific env default (Slurm JSON uses ``scgpt_ckpt`` for all)."""
+    p = (ui_path or "").strip()
+    if p:
+        return p
+    m = str(model or "").strip().lower()
+    if m == "geneformer":
+        return (os.environ.get("GENEFORMER_MODEL") or "").strip() or None
+    if m == "scgpt":
+        return (os.environ.get("SCGPT_CKPT_DIR") or "").strip() or None
+    if m == "transcriptformer":
+        return (os.environ.get("TRANSCRIPTFORMER_MODEL") or "").strip() or None
+    return None
+
+
 def attach_scfm_embedding(
     adata: ad.AnnData,
     model: str,
@@ -2260,7 +2399,7 @@ def attach_scfm_embedding(
         "false",
         "no",
     )
-    ckpt_res = (scgpt_ckpt or "").strip() or os.environ.get("SCGPT_CKPT_DIR")
+    ckpt_res = _resolve_scfm_weights_path(model, scgpt_ckpt)
     report_path: Optional[Path] = None
     crd = (compat_report_dir or "").strip()
     if crd:
@@ -2279,7 +2418,7 @@ def attach_scfm_embedding(
     )
     tkey = f"embed_{model}"
     with _timed(timings, tkey):
-        E = _SCFM_EMBED_REGISTRY[model](ad_emb, scgpt_ckpt, int(n_latent_scvi))
+        E = _SCFM_EMBED_REGISTRY[model](ad_emb, ckpt_res, int(n_latent_scvi))
     E = np.asarray(E, dtype=np.float32)
     if E.shape[0] != adata.n_obs:
         raise ValueError(
@@ -2288,6 +2427,8 @@ def attach_scfm_embedding(
     out = adata.copy()
     out.uns["scfms_validation"] = compat_summary
     out.uns["scfms_compat_report_pdf"] = str(pdf_p.resolve())
+    out.uns["scfms_embed_matrix_spec"] = str(matrix_spec)
+    out.uns["scfms_embed_model"] = str(model)
     out.obsm[key] = E
     nwarn = sum(1 for f in findings if f.level == "warn")
     tail = f" Compatibility PDF: {pdf_p}"
@@ -3305,11 +3446,12 @@ def build_ui():
             time_raw = str(slurm_time or "").strip()
             time_req = str(rec["time"]) if not time_raw or time_raw.lower() == "auto" else time_raw
             if scfm_slurm_gpu:
+                wpath = normalize_ui_weights_path(str(model), scgpt_ckpt)
                 sc_kwargs = dict(
                     model=str(model),
                     matrix_spec=str(embed_matrix),
                     obsm_key=(obsm_key_tb or "").strip() or None,
-                    scgpt_ckpt=(scgpt_ckpt or "").strip() or None,
+                    scgpt_ckpt=wpath,
                     n_latent_scvi=int(n_latent) if n_latent is not None else 64,
                 )
                 rr = (scfms_repo_root_tb or "").strip()
@@ -3372,11 +3514,12 @@ def build_ui():
                 )
 
             if scfm_run_background:
+                wpath = normalize_ui_weights_path(str(model), scgpt_ckpt)
                 sc_kwargs = dict(
                     model=str(model),
                     matrix_spec=str(embed_matrix),
                     obsm_key=(obsm_key_tb or "").strip() or None,
-                    scgpt_ckpt=(scgpt_ckpt or "").strip() or None,
+                    scgpt_ckpt=wpath,
                     n_latent_scvi=int(n_latent) if n_latent is not None else 64,
                 )
                 jid = bgjobs.start_scfm_job(adata, sc_kwargs)
@@ -3415,12 +3558,13 @@ def build_ui():
 
             t0 = time.perf_counter()
             crd = (session_dir or "").strip() or None
+            wpath = normalize_ui_weights_path(str(model), scgpt_ckpt)
             new_ad, msg, tmap = attach_scfm_embedding(
                 adata,
                 model=str(model),
                 matrix_spec=str(embed_matrix),
                 obsm_key=obsm_key_tb if obsm_key_tb else None,
-                scgpt_ckpt=scgpt_ckpt if scgpt_ckpt else None,
+                scgpt_ckpt=wpath,
                 n_latent_scvi=int(n_latent) if n_latent is not None else 64,
                 compat_report_dir=crd,
             )
@@ -4081,7 +4225,7 @@ def build_ui():
                 plot_pca = gr.Plot(label="PCA variance ratio")
                 plot_umap = gr.Plot(label="UMAP")
 
-        with gr.Accordion("Foundation models (Geneformer, scGPT, scVI)", open=False):
+        with gr.Accordion("Foundation models (Geneformer, Transcriptformer, scGPT, scVI)", open=False):
             gr.Markdown(
                 "Runs **`scripts.generate_embeddings`** on the current AnnData. Pick the **expression matrix** "
                 "used as input (counts or normalized — match what the model expects). Results are written to "
@@ -4091,7 +4235,7 @@ def build_ui():
                 "It writes a **new** `.h5ad` under **`<SCFMS_SLURM_EMBED_BASE>/<dataset>/embedded_<model>_<id>.h5ad`** "
                 "(`SCFMS_SLURM_EMBED_BASE` defaults to `scfms_job_store/slurm_embeddings`). "
                 "Set **Shell lines** to `conda activate …` or `module load` on the compute node. "
-                "Geneformer: **`GENEFORMER_MODEL`**. scGPT: **`SCGPT_CKPT_DIR`** or checkpoint textbox.\n\n"
+                "**Model weights / checkpoint** lists `./models/…` and env defaults for the selected model.\n\n"
                 "If **Slurm -c / --mem / -t** are left at **auto** (or below the app's minimum estimate), "
                 "the submit path resolves them from the current `AnnData` size and selected model.\n\n"
                 "Before every embedding, **compatibility checks** run (gene vocabulary, non-negativity, count-like heuristics) "
@@ -4099,15 +4243,17 @@ def build_ui():
                 "**`SCFMS_COMPAT_REPORT_DIR`** if no session). "
                 "Set **`SCFMS_SC_FM_COMPAT_STRICT=0`** to warn-only (no hard stop on errors). "
                 "Outputs also store **`uns['scfms_validation']`** on the returned AnnData.\n\n"
-                "**Adding a model in code:** call **`preprocess.register_scfm_embedder(name, fn)`** where ``fn(ad_emb, scgpt_ckpt, n_latent)`` "
+                "**Adding a model in code:** call **`preprocess.register_scfm_embedder(name, fn)`** where ``fn(ad_emb, weights_path, n_latent)`` "
                 "returns a ``(n_obs, n_latent_dim)`` float array; extend **`scfm_compatibility.FORMAT_REQUIREMENTS`** / "
                 "**`MODEL_TRAINING_CORPUS`** for PDF text; the Gradio **Model** radio lists registered names automatically."
             )
             with gr.Row():
                 _scfm_names = list_scfm_model_names()
+                _scfm_init = _scfm_names[0] if _scfm_names else "geneformer"
+                _scfm_w_ch, _scfm_w_val = model_weights_choices_and_value(_scfm_init)
                 scfm_model = gr.Radio(
                     _scfm_names,
-                    value=_scfm_names[0] if _scfm_names else "geneformer",
+                    value=_scfm_init,
                     label="Model",
                 )
                 embed_matrix = gr.Radio(
@@ -4120,9 +4266,13 @@ def build_ui():
                 placeholder="blank → X_<model>; or e.g. scvi_v1 → X_scvi_v1",
             )
             with gr.Row():
-                scfm_ckpt = gr.Textbox(
-                    label="scGPT checkpoint directory",
-                    placeholder="Required for scGPT if env SCGPT_CKPT_DIR unset",
+                scfm_ckpt = gr.Dropdown(
+                    choices=_scfm_w_ch,
+                    value=_scfm_w_val,
+                    allow_custom_value=True,
+                    label="Model weights / checkpoint",
+                    info="Scans ./models and env; type any path or Hugging Face id.",
+                    scale=3,
                 )
                 scfm_n_latent = gr.Number(
                     label="scVI n_latent",
@@ -4609,6 +4759,12 @@ def build_ui():
             cancel_message="**Cancelled** — preprocessing pipeline stopped.",
             msg_component_idx=5,
             workload_progress="full",
+        )
+
+        scfm_model.change(
+            model_weights_gr_update,
+            inputs=[scfm_model],
+            outputs=[scfm_ckpt],
         )
 
         _scfm_embed_outputs = [

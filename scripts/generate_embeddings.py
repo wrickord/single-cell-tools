@@ -221,12 +221,17 @@ def _temporary_env(updates: Dict[str, Optional[str]]):
 
 
 def embed_geneformer(
-    adata: ad.AnnData, device: Optional[str] = None, max_cells: Optional[int] = None
+    adata: ad.AnnData,
+    device: Optional[str] = None,
+    max_cells: Optional[int] = None,
+    pretrained_name_or_path: Optional[str] = None,
 ) -> np.ndarray:
     from transformers import AutoModel, AutoTokenizer
     import torch
 
-    model_name = os.environ.get("GENEFORMER_MODEL", "ctheodoris/Geneformer")
+    model_name = (pretrained_name_or_path or "").strip() or os.environ.get(
+        "GENEFORMER_MODEL", "ctheodoris/Geneformer"
+    )
     tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name)
     model.eval()
@@ -257,20 +262,54 @@ def embed_geneformer(
     return np.stack(embs)
 
 
+def _repo_root_for_embeddings() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _default_transcriptformer_checkpoint() -> str:
+    p = _repo_root_for_embeddings() / "models" / "transcriptformer" / "tf_sapiens"
+    return str(p.resolve()) if p.is_dir() else ""
+
+
 def embed_transcriptformer(
-    adata: ad.AnnData, device: Optional[str] = None, max_cells: Optional[int] = None
+    adata: ad.AnnData,
+    device: Optional[str] = None,
+    max_cells: Optional[int] = None,
+    pretrained_name_or_path: Optional[str] = None,
 ) -> np.ndarray:
     """
-    Embeds cells using CZI's Transcriptformer via Hugging Face.
-    Assumes the HF repo provides a compatible tokenizer (gene tokens) and model.
-    Default repo id can be overridden via env TRANSCRIPTFORMER_MODEL.
+    Lightweight path: Hugging Face ``transformers`` AutoModel cell embedding.
+
+    Official CZI checkpoints from ``download-weights`` (S3) are **PyTorch Lightning**
+    bundles (``model_weights.pt``), not HF repos — use the ``transcriptformer``
+    package / CLI for those. See ``models/README.md``.
     """
     from transformers import AutoModel, AutoTokenizer
     import torch
 
-    model_name = os.environ.get(
-        "TRANSCRIPTFORMER_MODEL", "cziscience/Transcriptformer-homo-sapiens-entire"
-    )
+    explicit = (pretrained_name_or_path or "").strip()
+    if explicit:
+        model_name = explicit
+    else:
+        model_name = (os.environ.get("TRANSCRIPTFORMER_MODEL") or "").strip()
+    if not model_name:
+        model_name = _default_transcriptformer_checkpoint()
+    if not model_name:
+        raise FileNotFoundError(
+            "TranscriptFormer: set TRANSCRIPTFORMER_MODEL to a Hugging Face model id or "
+            "local HF-format checkpoint, or run `uv run python main.py download-weights -- "
+            "--models transcriptformer` and use the official `transcriptformer` CLI for CZI weights "
+            "(see models/README.md)."
+        )
+
+    ckpt = Path(model_name)
+    if ckpt.is_dir() and (ckpt / "model_weights.pt").is_file():
+        raise RuntimeError(
+            f"Path {ckpt} is an official CZI TranscriptFormer checkpoint (model_weights.pt). "
+            "This helper only supports Hugging Face–style checkpoints. "
+            "Install `transcriptformer` from PyPI or GitHub and run inference with Hydra, "
+            "or see models/README.md."
+        )
     tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name)
     model.eval()

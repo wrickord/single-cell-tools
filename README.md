@@ -86,12 +86,12 @@ uv run python scripts/download_weights.py --models geneformer scgpt transcriptfo
 
 Available downloads include:
 
-- `geneformer`
-- `transcriptformer`
-- `scgpt`
-- `xtrimo`
+- `geneformer` (Hugging Face snapshot)
+- `transcriptformer` (official CZI weights from S3 — see `models/README.md` for variants)
+- `scgpt` (Google Drive folder)
+- `xtrimo` (Hugging Face; may need a token)
 
-Model files are stored under `models/` (see `models/README.md`). File contents are gitignored so the clone stays small.
+Model files are stored under `models/` (see **`models/README.md`** for TranscriptFormer layout and how it differs from Hugging Face). File contents are gitignored so the clone stays small.
 
 **Hugging Face:** some downloads (e.g. `xtrimo`) may need a token. Set **`HF_TOKEN`** in the environment or in `.env` — never commit it.
 
