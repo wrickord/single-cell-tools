@@ -2329,6 +2329,63 @@ def render_embedding_viewer_ui(
         )
 
 
+def _compute_embedding_viewer_plot_idx(
+    n_obs: int, max_cells: int, max_plot_cap: int
+) -> np.ndarray:
+    """Random subset when ``max_cells`` > 0; else all cells capped at ``max_plot_cap`` for safety."""
+    n = int(n_obs)
+    if n <= 0:
+        return np.arange(0, dtype=np.int64)
+    mc = int(max_cells or 0)
+    cap = max(1, int(max_plot_cap or 1))
+    if mc > 0:
+        k = min(mc, n)
+        rng = np.random.default_rng(1)
+        idx = np.sort(rng.choice(n, size=k, replace=False))
+    else:
+        idx = np.arange(n, dtype=np.int64)
+    if len(idx) > cap:
+        rng = np.random.default_rng(0)
+        pick = np.sort(rng.choice(len(idx), size=cap, replace=False))
+        idx = idx[pick]
+    return idx.astype(np.int64, copy=False)
+
+
+def _get_color_vector_subset(
+    adata: ad.AnnData,
+    plot_idx: np.ndarray,
+    gene_symbol: str | None,
+    color_by: str | None,
+) -> tuple[np.ndarray | None, str]:
+    """Color / expression aligned to ``plot_idx`` rows only (backed-friendly slices)."""
+    if isinstance(color_by, (list, tuple)) and color_by:
+        color_by = color_by[0]
+    if gene_symbol:
+        gs = str(gene_symbol).strip()
+        if gs:
+            var_low = pd.Index(adata.var_names.astype(str).str.lower())
+            m = (var_low == gs.lower()).to_numpy()
+            if m.any():
+                idx = int(np.where(m)[0][0])
+                Xcol = adata.X[plot_idx, idx]
+                if sp.issparse(Xcol):
+                    expr = np.asarray(Xcol.toarray()).ravel()
+                else:
+                    expr = np.asarray(Xcol).ravel()
+                return expr, f"Expression: {gs}"
+    cb = str(color_by or "").strip()
+    if cb and cb != "(none)" and cb in adata.obs.columns:
+        s = adata.obs.iloc[plot_idx][cb]
+        if pd.api.types.is_numeric_dtype(s.dtype) and not isinstance(
+            s.dtype, pd.CategoricalDtype
+        ):
+            vals = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
+            return vals, f"Color by: {cb}"
+        vals = s.astype(str).to_numpy()
+        return vals, f"Color by: {cb}"
+    return None, ""
+
+
 def _get_color_vector(
     adata: ad.AnnData, gene_symbol: str | None, color_by: str | None
 ) -> tuple[np.ndarray | None, str]:
@@ -2475,9 +2532,8 @@ def _embedding_figure_plan(n_dims_user: Any, n_avail: int) -> List[Tuple[str, Tu
 
 
 def _build_plotly_embedding_scatter2d(
-    E: np.ndarray,
-    plot_idx: np.ndarray,
-    adata: ad.AnnData,
+    E_sub: np.ndarray,
+    obs_sub: pd.DataFrame,
     i: int,
     j: int,
     color_vec: np.ndarray | None,
@@ -2492,8 +2548,8 @@ def _build_plotly_embedding_scatter2d(
     xi, xj = int(i), int(j)
     c1, c2 = f"Dim{xi + 1}", f"Dim{xj + 1}"
     df = pd.DataFrame(
-        {c1: E[plot_idx, xi], c2: E[plot_idx, xj]},
-        index=adata.obs_names[plot_idx],
+        {c1: E_sub[:, xi], c2: E_sub[:, xj]},
+        index=obs_sub.index,
     )
     if color_vec is not None:
         arr = np.asarray(color_vec)
@@ -2503,13 +2559,13 @@ def _build_plotly_embedding_scatter2d(
             df["__color__"] = np.asarray(arr, dtype=float)
     else:
         df["__color__"] = ""
-    if facet_by and facet_by in adata.obs.columns:
-        df["__facet__"] = adata.obs.loc[df.index, facet_by].astype(str).values
+    if facet_by and facet_by in obs_sub.columns:
+        df["__facet__"] = obs_sub[facet_by].astype(str).values
     else:
         df["__facet__"] = "all"
     for hc in hover_cols[:8]:
-        if hc in adata.obs.columns:
-            df[f"hover:{hc}"] = adata.obs.loc[df.index, hc].astype(str).values
+        if hc in obs_sub.columns:
+            df[f"hover:{hc}"] = obs_sub[hc].astype(str).values
     hover_data = {c: True for c in df.columns if c.startswith("hover:")}
     if facet_by and df["__facet__"].nunique() > 1:
         fig = px.scatter(
@@ -2547,9 +2603,8 @@ def _build_plotly_embedding_scatter2d(
 
 
 def _build_plotly_embedding_scatter3d(
-    E: np.ndarray,
-    plot_idx: np.ndarray,
-    adata: ad.AnnData,
+    E_sub: np.ndarray,
+    obs_sub: pd.DataFrame,
     axes: Tuple[int, int, int],
     color_vec: np.ndarray | None,
     color_title: str,
@@ -2564,11 +2619,11 @@ def _build_plotly_embedding_scatter3d(
     c1, c2, c3 = f"Dim{a + 1}", f"Dim{b + 1}", f"Dim{c + 1}"
     df = pd.DataFrame(
         {
-            c1: E[plot_idx, a],
-            c2: E[plot_idx, b],
-            c3: E[plot_idx, c],
+            c1: E_sub[:, a],
+            c2: E_sub[:, b],
+            c3: E_sub[:, c],
         },
-        index=adata.obs_names[plot_idx],
+        index=obs_sub.index,
     )
     if color_vec is not None:
         arr = np.asarray(color_vec)
@@ -2578,13 +2633,13 @@ def _build_plotly_embedding_scatter3d(
             df["__color__"] = np.asarray(arr, dtype=float)
     else:
         df["__color__"] = ""
-    if facet_by and facet_by in adata.obs.columns:
-        df["__facet__"] = adata.obs.loc[df.index, facet_by].astype(str).values
+    if facet_by and facet_by in obs_sub.columns:
+        df["__facet__"] = obs_sub[facet_by].astype(str).values
     else:
         df["__facet__"] = "all"
     for hc in hover_cols[:8]:
-        if hc in adata.obs.columns:
-            df[f"hover:{hc}"] = adata.obs.loc[df.index, hc].astype(str).values
+        if hc in obs_sub.columns:
+            df[f"hover:{hc}"] = obs_sub[hc].astype(str).values
     hover_data = {k: True for k in df.columns if k.startswith("hover:")}
     if facet_by and df["__facet__"].nunique() > 1:
         fig = px.scatter_3d(
@@ -2660,41 +2715,36 @@ def _render_embedding_viewer_plots(
         raise ValueError(
             f"obsm key {key!r} not found; available: {list(adata.obsm.keys())}"
         )
-    E = np.asarray(adata.obsm[key], dtype=np.float64)
-    if E.ndim != 2 or E.shape[1] < 2:
-        raise ValueError(f"obsm[{key!r}] must be 2D with ≥2 columns, got {E.shape}")
-    n_cols_orig = int(E.shape[1])
+    om = adata.obsm[key]
+    sh = getattr(om, "shape", None)
+    if sh is None or len(sh) != 2:
+        raise ValueError(f"obsm[{key!r}] must be 2D, got {type(om)}")
+    n_cells_total, n_cols_orig = int(sh[0]), int(sh[1])
+    if n_cols_orig < 2:
+        raise ValueError(
+            f"obsm[{key!r}] must have ≥2 columns, got {n_cols_orig}"
+        )
     try:
         nd_cap = int(view_n_dims) if view_n_dims is not None else 2
     except (TypeError, ValueError):
         nd_cap = 2
     nd_cap = max(2, nd_cap)
     n_use = min(nd_cap, n_cols_orig)
-    E = np.ascontiguousarray(E[:, :n_use])
-    n_cells = E.shape[0]
-    max_plot = sess_res.umap_plot_max_cells()
-    mc = int(max_cells or 0)
-    if mc > 0 and n_cells > mc:
-        rng2 = np.random.default_rng(1)
-        candidates = np.sort(rng2.choice(n_cells, size=mc, replace=False))
-    else:
-        candidates = np.arange(n_cells)
-    if len(candidates) > max_plot:
-        rng = np.random.default_rng(0)
-        rel = np.sort(rng.choice(len(candidates), size=max_plot, replace=False))
-        plot_idx = candidates[rel]
-    else:
-        plot_idx = candidates
 
-    color_vec_full, color_title = _get_color_vector(
-        adata, gene_symbol, viewer_color_by
+    max_plot = sess_res.umap_plot_max_cells()
+    plot_idx = _compute_embedding_viewer_plot_idx(
+        n_cells_total, int(max_cells or 0), max_plot
     )
-    if color_vec_full is not None and len(color_vec_full) != adata.n_obs:
-        color_vec_full, color_title = None, ""
-    cvec = (
-        np.asarray(color_vec_full)[plot_idx]
-        if color_vec_full is not None
-        else None
+    if len(plot_idx) == 0:
+        raise ValueError("No cells to plot.")
+
+    # Single backed slice: only these rows × first n_use embedding dimensions.
+    E_raw = adata.obsm[key][plot_idx, :n_use]
+    E_sub = np.ascontiguousarray(np.asarray(E_raw, dtype=np.float64))
+    obs_sub = adata.obs.iloc[plot_idx].copy()
+
+    cvec, color_title = _get_color_vector_subset(
+        adata, plot_idx, gene_symbol, viewer_color_by
     )
     if isinstance(hover_cols, (list, tuple)):
         hv_list = [str(x).strip() for x in hover_cols if str(x).strip()]
@@ -2702,7 +2752,7 @@ def _render_embedding_viewer_plots(
         hv_list = [x.strip() for x in str(hover_cols or "").split(",") if x.strip()]
     facet_s = None if (not facet_by or facet_by == "(none)") else str(facet_by)
 
-    plans = _embedding_figure_plan(nd_cap, E.shape[1])
+    plans = _embedding_figure_plan(nd_cap, E_sub.shape[1])
     if not plans:
         raise ValueError("Not enough embedding dimensions to plot.")
 
@@ -2712,9 +2762,8 @@ def _render_embedding_viewer_plots(
     for label, axes in plans:
         if len(axes) == 2:
             fig = _build_plotly_embedding_scatter2d(
-                E,
-                plot_idx,
-                adata,
+                E_sub,
+                obs_sub,
                 axes[0],
                 axes[1],
                 cvec,
@@ -2729,9 +2778,8 @@ def _render_embedding_viewer_plots(
             stem = f"view_{stem_base}_2d_{axes[0]+1}_{axes[1]+1}"
         elif len(axes) == 3:
             fig = _build_plotly_embedding_scatter3d(
-                E,
-                plot_idx,
-                adata,
+                E_sub,
+                obs_sub,
                 (axes[0], axes[1], axes[2]),
                 cvec,
                 color_title,
@@ -2752,12 +2800,19 @@ def _render_embedding_viewer_plots(
 
     primary_fig = figs[0][1]
     max_tbl = sess_res.embed_table_max_rows()
-    X_show = adata.X[:max_tbl]
+    n_tbl = min(max_tbl, len(plot_idx))
+    tbl_idx = plot_idx[:n_tbl]
+    n_show_vars = min(50, int(adata.n_vars))
+    X_show = adata.X[tbl_idx, :n_show_vars]
     if sp.issparse(X_show):
         df_arr = np.asarray(X_show.toarray())
     else:
         df_arr = np.asarray(X_show)
-    df_show = pd.DataFrame(df_arr, index=adata.obs_names[: len(df_arr)])
+    df_show = pd.DataFrame(
+        df_arr,
+        index=adata.obs_names[tbl_idx],
+        columns=adata.var_names[:n_show_vars].astype(str),
+    )
     try:
         sdp = Path(session_dir).expanduser().resolve()
         pd.DataFrame({"cell": adata.obs_names[plot_idx]}).to_csv(
@@ -2772,9 +2827,26 @@ def _render_embedding_viewer_plots(
             sel_axes = (int(axes[0]), int(axes[1]))
             break
 
+    mc_ui = int(max_cells or 0)
+    cap_note = ""
+    if mc_ui <= 0 and n_cells_total > len(plot_idx):
+        cap_note = (
+            f" — viewer max **0** uses all cells up to display cap **{max_plot:,}**; "
+            f"set **Viewer max cells** to sample a specific random subset"
+        )
+    elif mc_ui > 0:
+        if len(plot_idx) < min(mc_ui, n_cells_total):
+            cap_note = (
+                f" — requested **{min(mc_ui, n_cells_total):,}** cells, further capped to **{max_plot:,}** for display"
+            )
+        elif len(plot_idx) < n_cells_total:
+            cap_note = f" — random **{len(plot_idx):,}** of **{n_cells_total:,}** cells"
+
     status = (
-        f"Embedding viewer: `{key}` — using first **{n_use}** / {n_cols_orig} obsm columns "
-        f"(# dims setting={nd_cap}), points plotted={len(plot_idx):,}\n"
+        f"Embedding viewer: `{key}` — loaded **{n_use}** / {n_cols_orig} obsm columns "
+        f"(# dims={nd_cap}), plotted **{len(plot_idx):,}** cells "
+        f"({n_cells_total:,} total in file){cap_note}\n"
+        f"Matrix table: up to **{n_tbl}** plotted cells × **{n_show_vars}** genes.\n"
         f"Saved {len(artifacts)} figure(s) under `{Path(session_dir).expanduser().resolve() / 'plots'}`\n"
         f"Data file (DE / selection): `{data_path}`"
     )
@@ -2785,6 +2857,7 @@ def _render_embedding_viewer_plots(
         "view_n_dims": int(nd_cap),
         "view_n_dims_used": int(n_use),
         "max_cells": int(max_cells or 0),
+        "viewer_plot_n_cells": int(len(plot_idx)),
         "select_axes": sel_axes,
         "plot_artifacts": artifacts,
     }
@@ -3315,13 +3388,13 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
                 allow_custom_value=True,
             )
             viewer_max_cells = gr.Number(
-                label="Viewer max cells (0 = all; display only)",
+                label="Viewer max cells (0 = all rows, capped by display limit; >0 = random subset, that size)",
                 value=0,
                 precision=0,
                 minimum=0,
             )
             viewer_n_dims = gr.Number(
-                label="# dims to use (subset leading obsm columns; ≥3 adds extra 2D/3D panels)",
+                label="# dims (only leading obsm columns are read from disk for the viewer)",
                 value=2,
                 precision=0,
                 minimum=2,
