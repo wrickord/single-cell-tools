@@ -78,6 +78,12 @@ def _load_adata_from_inputs(
     sess_bundle: Optional[Dict[str, Any]] = None,
     consume_dense_ram: bool = False,
 ) -> ad.AnnData:
+    if isinstance(sess_bundle, dict):
+        sd = str(sess_bundle.get("dir") or "").strip()
+        if sd:
+            cached = pre.dense_session_get_adata(sd)
+            if cached is not None:
+                return cached
     if consume_dense_ram and isinstance(sess_bundle, dict):
         sd = str(sess_bundle.get("dir") or "").strip()
         if sd:
@@ -194,10 +200,8 @@ def _dense_status_from_bundle(sess_bundle: Optional[Dict[str, Any]]) -> str:
             "Dense load finished in RAM — click **Load Data** to use the full matrix for this session."
         )
     if st.get("state") == "error":
-        kind, payload = pre.dense_load_pop_terminal(str(sdp))
+        _, payload = pre.dense_load_pop_terminal(str(sdp))
         err = str(payload or st.get("error") or "").strip() or "unknown error"
-        if kind == "error":
-            return f"Dense load failed:\n{err}"
         return f"Dense load failed:\n{err}"
     return (
         "Current dataset is backed-only.\n"
@@ -289,6 +293,12 @@ def _ensure_session(
     d = (sess_bundle or {}).get("dir") if isinstance(sess_bundle, dict) else None
     if prev == src_key and d and str(d).strip():
         return str(d), sess_bundle  # type: ignore[return-value]
+
+    if d and str(d).strip():
+        try:
+            pre.dense_session_clear_adata(str(Path(str(d)).expanduser().resolve()))
+        except OSError:
+            pre.dense_session_clear_adata(str(d))
 
     if src_key[0] in ("server", "path") and src_key[1]:
         label = Path(src_key[1]).stem
@@ -759,16 +769,16 @@ def _load_obs_value_choices(
     )
     if not preferred:
         return []
-        adata = _load_adata_from_inputs(
-            None,
-            server_h5ad_path,
-            transpose,
-            backed=True,
-            preferred_h5ad_path=preferred,
-            sess_bundle=sess_bundle,
-        )
-        try:
-            return _unique_obs_values(adata, gcol)
+    adata = _load_adata_from_inputs(
+        None,
+        server_h5ad_path,
+        transpose,
+        backed=True,
+        preferred_h5ad_path=preferred,
+        sess_bundle=sess_bundle,
+    )
+    try:
+        return _unique_obs_values(adata, gcol)
     finally:
         _close_adata_handle(adata)
 
@@ -1049,6 +1059,7 @@ def refresh_benchmark_sources_ui(
             transpose,
             backed=True,
             preferred_h5ad_path=preferred,
+            sess_bundle=sess_bundle,
         )
         try:
             catalog = _build_benchmark_source_catalog(
@@ -1191,6 +1202,7 @@ def prepare_benchmark_dataset_ui(
             transpose,
             backed=True,
             preferred_h5ad_path=preferred,
+            sess_bundle=sess_bundle,
         )
         src_key = _session_src_key(None, server_h5ad_path)
         session_dir, bundle = _ensure_session(sess_bundle, src_key, adata)
@@ -1737,6 +1749,7 @@ def recompute_distributions_ui(
             transpose,
             backed=True,
             preferred_h5ad_path=preferred,
+            sess_bundle=sess_bundle_dict,
         )
         try:
             spec = str(matrix_spec or "X").strip() or "X"
@@ -2086,6 +2099,7 @@ def start_view_job(
             transpose,
             backed=True,
             preferred_h5ad_path=preferred,
+            sess_bundle=sess_bundle,
         )
         try:
             src_key = _session_src_key(None, server_h5ad_path)
@@ -2515,6 +2529,7 @@ def run_embed(
             transpose,
             backed=True,
             preferred_h5ad_path=preferred,
+            sess_bundle=sess_bundle,
         )
         session_dir, bundle = _ensure_session(sess_bundle, src_key, adata)
         bundle = _bundle_with_materialized_paths(bundle, source_h5ad_path=preferred)
@@ -4462,7 +4477,12 @@ with gr.Blocks(title="scFMs: Organoid Embeddings") as demo:
         ):
             # Load data via same mechanism
             try:
-                adata = _load_adata_from_inputs(None, server_h5ad_path or "", bool(transpose))
+                adata = _load_adata_from_inputs(
+                    None,
+                    server_h5ad_path or "",
+                    bool(transpose),
+                    sess_bundle=sess_bundle_dict,
+                )
             except Exception as e:
                 return (
                     "Error loading data: %s" % e,

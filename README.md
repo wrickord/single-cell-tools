@@ -18,6 +18,14 @@ uv sync
 uv run python main.py embeddings
 ```
 
+You can launch the same Gradio UI by running the app module directly from the repo root:
+
+```bash
+uv run python app/app.py
+```
+
+`main.py embeddings` is a thin wrapper that runs `app.app` as a module (`python -m app.app`); using `app/app.py` skips the CLI and is handy in editors or when you only care about the embeddings UI.
+
 Then open the URL Gradio prints (often `http://127.0.0.1:7861`), point the app at a server-side `.h5ad`, `.csv`, or `.tsv`, choose a model, and run embeddings on the current node or through `sbatch`. Adjust **Slurm partition** and **`--gres`** in the UI to match your cluster.
 
 ## What you can do with it
@@ -42,10 +50,16 @@ That creates the environment from `pyproject.toml` and `uv.lock`.
 
 ## Quick start
 
-Launch the app:
+Launch the app (either form is equivalent for the embeddings UI):
 
 ```bash
 uv run python main.py embeddings
+```
+
+or:
+
+```bash
+uv run python app/app.py
 ```
 
 From there, a typical workflow looks like this:
@@ -143,9 +157,9 @@ uv run python scripts/submit_scfm_embedding_slurm.py \
 
 ## Repo layout
 
-- `app/`: the Gradio application and related UI logic
+- `app/`: the Gradio application and related UI logic (`app/app.py` can be run with `uv run python app/app.py`)
 - `scripts/`: download helpers, embedding utilities, and Slurm helpers
-- `main.py`: a simple CLI entrypoint for the most common commands
+- `main.py`: a simple CLI entrypoint for the most common commands (e.g. `embeddings` delegates to `app.app`)
 - `.data/`: managed dataset workspace created at runtime
 - `models/`: local model weights and checkpoints
 

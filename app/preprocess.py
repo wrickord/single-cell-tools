@@ -97,6 +97,26 @@ DENSE_MATERIALIZED_H5AD = "adata_dense_materialized.h5ad"
 # No ``adata_dense_materialized.h5ad`` copy — results stay in RAM until the UI consumes them.
 _DENSE_JOB_LOCK = threading.Lock()
 _DENSE_JOBS: Dict[str, Dict[str, Any]] = {}
+# After ``dense_ram_take_if_ready``, the AnnData is kept here so Gradio callbacks can reuse it
+# without re-opening backed mode or writing a materialized ``.h5ad``.
+_DENSE_SESSION_CACHE_LOCK = threading.Lock()
+_DENSE_SESSION_ADATA: Dict[str, ad.AnnData] = {}
+
+
+def dense_session_get_adata(session_dir: str) -> Optional[ad.AnnData]:
+    key = dense_job_key(session_dir)
+    if not key:
+        return None
+    with _DENSE_SESSION_CACHE_LOCK:
+        return _DENSE_SESSION_ADATA.get(key)
+
+
+def dense_session_clear_adata(session_dir: str) -> None:
+    key = dense_job_key(session_dir)
+    if not key:
+        return
+    with _DENSE_SESSION_CACHE_LOCK:
+        _DENSE_SESSION_ADATA.pop(key, None)
 
 
 def dense_job_key(session_dir: str) -> str:
@@ -159,6 +179,7 @@ def dense_load_start(session_dir: str, src_h5ad: str) -> tuple[bool, str]:
             pth.unlink(missing_ok=True)
         except OSError:
             pass
+    dense_session_clear_adata(key)
     with _DENSE_JOB_LOCK:
         cur = _DENSE_JOBS.get(key)
         if cur and cur.get("state") == "running":
@@ -226,7 +247,11 @@ def dense_ram_take_if_ready(session_dir: str) -> Optional[ad.AnnData]:
             return None
         adata = cur.get("adata")
         del _DENSE_JOBS[key]
-    return adata if isinstance(adata, ad.AnnData) else None
+    out = adata if isinstance(adata, ad.AnnData) else None
+    if out is not None:
+        with _DENSE_SESSION_CACHE_LOCK:
+            _DENSE_SESSION_ADATA[key] = out
+    return out
 
 
 def dense_load_pop_terminal(session_dir: str) -> tuple[str, Optional[str]]:
@@ -2416,7 +2441,7 @@ def build_ui():
                 if h5ad_file is None:
                     return _empty_load_ret(
                         f"No `.h5ad` found under `{root}`. Use **Save** (writes `adata_latest.h5ad`), "
-                        f"finish **Load dense** (`adata_dense_materialized.h5ad`), or copy a `result.h5ad` here."
+                        f"run **Load dense** (in-RAM, no extra copy) then continue from this folder, or copy a `result.h5ad` here."
                     )
                 session_dir_str = str(root.resolve())
                 resume_kind = "session_folder"
